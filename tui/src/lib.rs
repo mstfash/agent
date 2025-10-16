@@ -1,23 +1,29 @@
 mod app;
 mod event;
-mod terminal;
 mod view;
 
 pub use app::{AppState, InputEvent, LoadingOperation, OutputEvent, SessionInfo};
 pub use ratatui::style::Color;
 
 mod services;
-
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
-use crossterm::{execute, terminal::EnterAlternateScreen};
+use std::io::stdout;
+
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+
+use ratatui::crossterm::event::EnableMouseCapture;
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::disable_raw_mode;
+use ratatui::crossterm::terminal::enable_raw_mode;
+
 pub use event::map_crossterm_event_to_input_event;
 use ratatui::style::Style;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use stakpak_shared::models::integrations::openai::ToolCallResultStatus;
 use std::io;
-pub use terminal::TerminalGuard;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Duration, interval};
 pub use view::view;
@@ -40,9 +46,9 @@ pub fn toggle_mouse_capture(state: &mut AppState) -> io::Result<()> {
     state.mouse_capture_enabled = !state.mouse_capture_enabled;
 
     if state.mouse_capture_enabled {
-        execute!(std::io::stdout(), EnableMouseCapture)?;
+        execute!(stdout(), EnableMouseCapture)?;
     } else {
-        execute!(std::io::stdout(), DisableMouseCapture)?;
+        execute!(stdout(), DisableMouseCapture)?;
     }
 
     let status = if state.mouse_capture_enabled {
@@ -75,6 +81,26 @@ fn toggle_mouse_capture_with_redraw<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+fn set_panic_hook() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = restore(); // ignore any errors as we are already failing
+        hook(panic_info);
+    }));
+}
+
+/// Restore the terminal to its original state.
+/// Inverse of `set_modes`.
+pub fn restore() -> io::Result<()> {
+    // Pop may fail on platforms that didn't support the push; ignore errors.
+    execute!(stdout(), DisableMouseCapture)?;
+    execute!(stdout(), DisableBracketedPaste)?;
+    execute!(stdout(), LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+    let _ = execute!(stdout(), crossterm::cursor::Show);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
     mut input_rx: Receiver<InputEvent>,
@@ -90,14 +116,27 @@ pub async fn run_tui(
     current_profile_name: String,
     rulebook_config: Option<RulebookConfig>,
 ) -> io::Result<()> {
-    let _guard = TerminalGuard;
+    let _ = color_eyre::install();
 
-    crossterm::terminal::enable_raw_mode()?;
+    // Forward panic reports through log so they appear in the UI status
+    // line, but do not swallow the default/color-eyre panic handler.
+    // Chain to the previous hook so users still get a rich panic report
+    // (including backtraces) after we restore the terminal.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("panic: {info}");
+        prev_hook(info);
+    }));
+
+    // let _guard: TerminalGuard = TerminalGuard;
+
+    enable_raw_mode()?;
 
     // Detect terminal support for mouse capture
     let terminal_info = crate::services::detect_term::detect_terminal();
     let enable_mouse_capture = is_unsupported_terminal(&terminal_info.emulator);
-
+    execute!(stdout(), EnableBracketedPaste)?;
+    execute!(stdout(), EnableBracketedPaste)?;
     execute!(
         std::io::stdout(),
         EnterAlternateScreen,
@@ -110,8 +149,24 @@ pub async fn run_tui(
         execute!(std::io::stdout(), DisableMouseCapture)?;
     }
 
+    // Enable keyboard enhancement flags so modifiers for keys like Enter are disambiguated.
+    // chat_composer.rs is using a keyboard event listener to enter for any modified keys
+    // to create a new line that require this.
+    // Some terminals (notably legacy Windows consoles) do not support
+    // keyboard enhancement flags. Attempt to enable them, but continue
+    // gracefully if unsupported.
+    let _ = execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    );
+
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
+    set_panic_hook();
     let term_size = terminal.size()?;
 
     let mut state = AppState::new(
@@ -307,7 +362,7 @@ pub async fn run_tui(
     }
 
     let _ = shutdown_tx.send(());
-    crossterm::terminal::disable_raw_mode()?;
+    disable_raw_mode()?;
     execute!(
         std::io::stdout(),
         crossterm::terminal::LeaveAlternateScreen,
